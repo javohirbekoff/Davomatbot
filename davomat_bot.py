@@ -107,7 +107,8 @@ class Access(BaseMiddleware):
         # Ulangan guruhdagi oddiy ro'yxatlarni istalgan a'zo yuborishi mumkin.
         # Admin paneli va /start uchun avvalgi ruxsat tekshiruvi saqlanadi.
         if isinstance(event, Message) and event.chat.type in {'group','supergroup'}:
-            if event.text and not event.text.startswith('/'):
+            body = event.text or event.caption or ''
+            if body and not body.startswith('/'):
                 linked = await db('SELECT id FROM groups WHERE chat_id=?', (event.chat.id,))
                 if linked:
                     return await handler(event, data)
@@ -365,6 +366,25 @@ async def group_info(message: Message):
         'Shu IDni botning shaxsiy chatidagi guruh qo‘shish paneliga kiriting.')
 
 
+def attendance_payload(text, sent_at):
+    """Talaba/Vaqt kartasi yoki oddiy ro'yxat. Sana: kun/oy/yil."""
+    students = re.findall(r'^[^\w\n]*Talaba\s*:\s*([^\n]+)', text, flags=re.I | re.M)
+    day = sent_at.astimezone(TZ).date()
+    if students:
+        times = re.findall(r'^[^\w\n]*Vaqt\s*:\s*([^\n]*)', text, flags=re.I | re.M)
+        if len(times) > 1:
+            raise ValueError('Bitta xabarda bir nechta Vaqt maydoni bor')
+        if times:
+            value = times[0].strip()
+            if not re.fullmatch(r'\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}(?::\d{2})?', value):
+                raise ValueError('Vaqt formati: DD/MM/YYYY HH:MM[:SS]')
+            fmt = '%d/%m/%Y %H:%M:%S' if value.count(':') == 2 else '%d/%m/%Y %H:%M'
+            day = datetime.strptime(value, fmt).date()
+        text = '\n'.join(name.strip() for name in students)
+    if day > today():
+        raise ValueError('Kelajak sanasi')
+    return day.isoformat(), text
+
 def auto_attendance(gid, day, text):
     # Bir kunda yuborilgan ro'yxatlar birlashtiriladi; takroriy xabar zarar qilmaydi.
     with closing(connection()) as con, con:
@@ -386,15 +406,20 @@ def auto_attendance(gid, day, text):
         return present, len(people), len(found)
 
 
-@dp.message(F.chat.type.in_({'group','supergroup'}), F.text)
+@dp.message(F.chat.type.in_({'group','supergroup'}), F.text | F.caption)
 async def group_message(message: Message):
+    body = message.text or message.caption or ''
     rows = await db('SELECT id FROM groups WHERE chat_id=?',(message.chat.id,))
-    if not rows or message.text.startswith('/'):
+    if not rows or body.startswith('/'):
         return
-    # Sana xabarning Telegramdagi yuborilish vaqtidan, Toshkent vaqti bilan olinadi.
-    day = message.date.astimezone(TZ).date().isoformat()
-    # Guruhga hech qanday tasdiq yuborilmaydi; natija faqat bazada saqlanadi.
-    await asyncio.to_thread(auto_attendance, rows[0]['id'], day, message.text)
+    try:
+        day, names = attendance_payload(body, message.date)
+    except ValueError as exc:
+        LOG.warning('Davomat kartasi olinmadi: chat=%s message=%s sabab=%s',
+                    message.chat.id, message.message_id, exc)
+        return
+    # Guruhga javob yo'q. Dars va lokatsiya ism sifatida ishlatilmaydi.
+    await asyncio.to_thread(auto_attendance, rows[0]['id'], day, names)
 
 @dp.message(F.chat.type == 'private')
 async def fallback(message: Message):
@@ -465,6 +490,7 @@ if __name__=='__main__':
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s %(message)s')
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
+
 
 
 
